@@ -9,3 +9,14 @@ dependencies = [
 [[tool.uv.index]]
 url = "https://mirrors.aliyun.com/pypi/simple/"
 default = true
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.ruff.lint]
+# Journal crash recovery must catch torn/corrupt tails broadly; __enter__
+# returning the concrete engine type is intentional; a+b open in DurableStore
+# deliberately keeps the handle for the process lifetime.
+ignore = ["BLE001", "PYI034", "SIM115"]

@@ -7,3 +7,7 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+.state/
+.smoke_state/
+.smoke.log
+tmp*/
