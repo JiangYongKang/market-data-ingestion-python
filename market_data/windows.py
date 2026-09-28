@@ -69,17 +69,38 @@ class WindowAggregator:
         bucket[event.event_id] = event  # 去重已在上层保证；键防御重复计数
         return True
 
-    def publish_due(self, watermark_ms: int) -> list[WindowFeature]:
+    def remove(self, symbol: str, event_id: str) -> Event | None:
+        """从打开窗口中移出一条事件（多来源获胜者替换时使用）。
+
+        仅作用于未发布窗口；窗口已发布或事件不存在时返回 None。
+        """
+        for (sym, _w0), bucket in self._open.items():
+            if sym == symbol and event_id in bucket:
+                ev = bucket.pop(event_id)
+                if not bucket:
+                    self._open.pop((sym, _w0), None)
+                return ev
+        return None
+
+    def publish_due(self, watermark_ms: int,
+                    symbol: str | None = None) -> list[WindowFeature]:
         """发布所有右边界已越过水位的窗口，确定性顺序 (symbol, w_start)。
 
         判定：不存在还能落入该窗口的未到达事件，即
         ``window_end_ms - 1 <= watermark_ms``（可接受事件须
         ``event_time > watermark``，故其时间必 >= window_end）。
+
+        ``symbol`` 非空时只发布该标的（多来源路径按标的各自的合并水位
+        即最慢渠道水位调用）。
         """
-        due = sorted(
-            (key for key, bucket in self._open.items()
-             if key[1] + self._size - 1 <= watermark_ms and bucket),
-        )
+        def _due(key):
+            sym, _w = key
+            if symbol is not None and sym != symbol:
+                return False
+            bucket = self._open.get(key)
+            return bool(bucket) and key[1] + self._size - 1 <= watermark_ms
+
+        due = sorted(key for key in self._open if _due(key))
         out: list[WindowFeature] = []
         for symbol, w0 in due:
             bucket = self._open.pop((symbol, w0))

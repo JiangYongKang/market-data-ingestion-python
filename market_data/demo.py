@@ -92,6 +92,23 @@ def main() -> None:
               f"p99={snap['ingest']['p99_ns_per_event']:.0f}; "
               f"state≈{snap['estimated_state_bytes']/1e6:.1f}MB; "
               f"published={snap['published_windows']}")
+
+        print("== 8. 多来源合并（同标的三渠道，优先级 venueA>venueB>venueC） ==")
+        ms = MarketDataService(Config(
+            data_dir=":memory:",
+            multi_source_symbols={"MS": ["venueA", "venueB", "venueC"]}))
+        r = ms.ingest_sync([
+            ev("m1", 1_000, 10, 2, sym="MS", src="venueA", seq=1, trade_id="X1"),
+            ev("m2", 2_000, 10, 2, sym="MS", src="venueB", seq=1, trade_id="X1"),
+            ev("m3", 3_000, 11, 2, sym="MS", src="venueC", seq=1, trade_id="X1"),
+        ])
+        print(f"  accepted={r.accepted} merged={r.merged} "
+              f"quarantined={r.quarantined}（同一笔只计一次量，价格冲突隔离）")
+        for q in ms.quarantine_list("MS"):
+            print(f"  conflict {q.event.event_id}: {q.detail}")
+        print("  渠道推进:", {
+            c["source"]: c["max_event_time_ms"]
+            for c in ms.channel_snapshot()["MS"]["channels"]})
         print("DEMO_OK")
 
 

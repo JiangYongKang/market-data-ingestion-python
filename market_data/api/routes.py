@@ -60,6 +60,7 @@ def _result_dict(r) -> dict[str, Any]:
         "duplicate": r.duplicate,
         "quarantined": r.quarantined,
         "rejected": r.rejected,
+        "merged": r.merged,
         "details": [
             {"event_id": eid, "reason": reason.value, "detail": detail}
             for eid, reason, detail in r.details
@@ -109,6 +110,40 @@ def create_router(service) -> APIRouter:
     async def quarantine(symbol: str | None = None) -> dict:
         items = service.quarantine_list(symbol)
         return {"count": len(items), "items": [_quarantine_dict(q) for q in items]}
+
+    @router.get("/merges")
+    async def merges(symbol: str | None = None) -> dict:
+        """跨渠道合并/冲突审计：胜负渠道、event_id、最终归类。"""
+        records = service.merge_records()
+        if symbol is not None:
+            records = [r for r in records if r.symbol == symbol]
+        return {
+            "count": len(records),
+            "items": [
+                {
+                    "symbol": r.symbol, "trade_id": r.trade_id, "kind": r.kind,
+                    "winner": r.winner, "loser": r.loser,
+                    "winner_event_id": r.winner_event_id,
+                    "loser_event_id": r.loser_event_id,
+                    "decided_at_ms": r.decided_at_ms,
+                }
+                for r in records
+            ],
+        }
+
+    @router.get("/channels")
+    async def channels(symbol: str | None = None) -> dict:
+        """多渠道推进观测：各渠道事件时间、独立水位、落后量、是否卡住。"""
+        snap = service.channel_snapshot()
+        if symbol is not None:
+            body = snap.get(symbol)
+            return {"symbol": symbol, "channels": body["channels"],
+                    "symbol_watermark_ms": body["symbol_watermark_ms"],
+                    "channel_count": body["channel_count"],
+                    "stuck_count": body["stuck_count"]} if body else \
+                {"symbol": symbol, "channels": [], "symbol_watermark_ms": None,
+                 "channel_count": 0, "stuck_count": 0}
+        return {"symbols": snap}
 
     @router.get("/checkpoints")
     async def checkpoints_get() -> dict:

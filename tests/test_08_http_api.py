@@ -89,3 +89,58 @@ def test_benchmark_endpoint_reports_budget_and_idempotent_replay(client):
     assert body["replay_accepted"] == 0 and body["replay_duplicate"] == 3000
     assert "elapsed_ms" in body and "within_time_budget" in body
     assert "estimated_state_bytes" in body and "within_memory_cap" in body
+
+
+def test_multi_source_merges_channels_and_conflict(client):
+    """HTTP：多来源合并/冲突 + /merges + /channels + metrics 字段。"""
+    from market_data.app import create_app
+    from market_data.config import Config
+    # client 夹具是单来源；单独构建多来源应用
+    import tempfile
+    d = tempfile.mkdtemp()
+    app = create_app(Config(data_dir=d,
+                            multi_source_symbols={"MS": ["p0", "p1", "p2"]}))
+    c = TestClient(app)
+    r = c.post("/ingest", json=[
+        _ev("m0", 1000, 10.0, 2.0, symbol="MS", source="p0", seq=1, trade_id="X1"),
+        _ev("m1", 2000, 10.0, 2.0, symbol="MS", source="p1", seq=1, trade_id="X1"),
+        _ev("m2", 3000, 11.0, 2.0, symbol="MS", source="p2", seq=1, trade_id="X1"),
+    ])
+    body = r.json()
+    assert r.status_code == 200
+    assert body["accepted"] == 1 and body["merged"] == 1
+    assert body["quarantined"] == 1
+    kinds = {d["event_id"]: d["reason"] for d in body["details"]}
+    assert kinds["m1"] == "merged_identical"
+    assert kinds["m2"] == "cross_source_conflict"
+
+    merges = c.get("/merges?symbol=MS").json()
+    assert merges["count"] == 2
+    assert {i["kind"] for i in merges["items"]} == {"merged", "conflict"}
+
+    ch = c.get("/channels?symbol=MS").json()
+    assert ch["channel_count"] == 3
+    by_src = {x["source"]: x for x in ch["channels"]}
+    assert by_src["p0"]["max_event_time_ms"] == 1000
+    assert by_src["p2"]["max_event_time_ms"] == 3000
+    assert ch["symbol_watermark_ms"] == -4000  # 最慢 p2: 3000-5000
+
+    m = c.get("/metrics").json()
+    assert m["merged"] == 1 and m["cross_source_conflicts"] == 1
+    assert "MS" in m["channels"]
+
+
+def test_channel_limit_returns_422(client):
+    from market_data.app import create_app
+    from market_data.config import Config
+    import tempfile
+    d = tempfile.mkdtemp()
+    app = create_app(Config(data_dir=d,
+                            multi_source_symbols={"MS": ["p0"]},
+                            max_channels_per_symbol=1))
+    c = TestClient(app)
+    r = c.post("/ingest", json=[
+        _ev("rogue", 1000, symbol="MS", source="pX", seq=1, trade_id="Z"),
+    ])
+    assert r.status_code == 422
+    assert r.json()["error"]["reason"] == "channel_limit_exceeded"

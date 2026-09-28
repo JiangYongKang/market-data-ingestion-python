@@ -34,6 +34,10 @@ class Metrics:
     rollback_rejected: int = 0
     backpressure_rejected: int = 0
     stale_sequence: int = 0
+    # --- 多来源 ---
+    merged: int = 0               # 跨渠道一致合并掉的副本数
+    cross_source_conflicts: int = 0  # 跨渠道关键内容冲突隔离的副本数
+    channel_rejected: int = 0     # 渠道数超上限拒绝数
     batches: int = 0
     events_seen: int = 0
     pending_events: int = 0
@@ -75,6 +79,9 @@ class Metrics:
             "rollback_rejected": self.rollback_rejected,
             "backpressure_rejected": self.backpressure_rejected,
             "stale_sequence": self.stale_sequence,
+            "merged": self.merged,
+            "cross_source_conflicts": self.cross_source_conflicts,
+            "channel_rejected": self.channel_rejected,
             "batches": self.batches,
             "events_seen": self.events_seen,
             "pending_events": self.pending_events,
