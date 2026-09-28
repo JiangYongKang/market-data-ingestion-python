@@ -60,6 +60,7 @@ def _result_dict(r) -> dict[str, Any]:
         "duplicate": r.duplicate,
         "quarantined": r.quarantined,
         "rejected": r.rejected,
+        "merged": getattr(r, "merged", 0),
         "details": [
             {"event_id": eid, "reason": reason.value, "detail": detail}
             for eid, reason, detail in r.details
@@ -92,8 +93,9 @@ def create_router(service) -> APIRouter:
             raise HTTPException(status_code=409, detail={
                 "reason": exc.reason.value, "message": str(exc)}) from exc
         except IngestionError as exc:
-            # 结构错误/内容冲突：整批拒绝，返回 422 且原因可区分
-            return JSONResponse(status_code=422, content={"error": {
+            # 渠道数量上限属资源类拒绝（503）；其余结构/内容冲突整批拒绝 422
+            status = 503 if exc.reason is RejectReason.SOURCE_LIMIT_REJECTED else 422
+            return JSONResponse(status_code=status, content={"error": {
                 "event_id": exc.event_id,
                 "reason": exc.reason.value,
                 "message": str(exc),
@@ -109,6 +111,18 @@ def create_router(service) -> APIRouter:
     async def quarantine(symbol: str | None = None) -> dict:
         items = service.quarantine_list(symbol)
         return {"count": len(items), "items": [_quarantine_dict(q) for q in items]}
+
+    @router.get("/merged")
+    async def merged() -> dict:
+        """跨渠道合并留痕：被合并次报 -> 主报/主渠道的对应关系。"""
+        items = service.merged_trades()
+        return {"count": len(items), "items": items}
+
+    @router.get("/channels")
+    async def channels() -> dict:
+        """多来源渠道推进观测（单来源模式返回 enabled=false）。"""
+        snap = service.channels_snapshot()
+        return {"enabled": snap is not None, "channels": snap}
 
     @router.get("/checkpoints")
     async def checkpoints_get() -> dict:

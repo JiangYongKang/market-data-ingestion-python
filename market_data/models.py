@@ -47,6 +47,10 @@ class RejectReason(str, Enum):
     # 幂等相关
     DUPLICATE_IDENTICAL = "duplicate_identical"  # 完全一致的重复投递
     DUPLICATE_CONFLICT = "duplicate_conflict"    # 同 event_id 内容冲突
+    # 多来源合并相关
+    CROSS_SOURCE_MERGED = "cross_source_merged"  # 跨渠道同一笔成交，被合并（非主报）
+    MERGE_CONFLICT = "merge_conflict"            # 跨渠道同笔成交价格/数量对不上
+    SOURCE_LIMIT_REJECTED = "source_limit_rejected"  # 渠道数量超过上限
     # 乱序/水位相关
     LATE_BEYOND_WATERMARK = "late_beyond_watermark"  # 超水位迟到 -> 隔离区
     # 位点相关
@@ -109,6 +113,20 @@ class WindowFeature:
 
 
 @dataclass(frozen=True, slots=True)
+class MergedTradeRecord:
+    """跨渠道同一笔成交的合并记录：以主报为准，被合并路留痕。"""
+
+    trade_key: tuple[str, str]          # (symbol, trade_id)
+    winner_event_id: str
+    winner_source: str
+    loser_event_id: str
+    loser_source: str
+    event_time_ms: int                  # 被合并（次报）事件时间
+    loser_event: Event | None = None    # 被合并事件完整内容（持久化/恢复用）
+    loser_seq: int = -1                 # 被合并事件来源序号（位点/去重恢复用）
+
+
+@dataclass(frozen=True, slots=True)
 class IngestResult:
     """单条/批次写入的判定结果（全部原子成功，或全部不生效）。"""
 
@@ -116,4 +134,5 @@ class IngestResult:
     duplicate: int
     quarantined: int
     rejected: int
+    merged: int = 0                     # 跨渠道被合并掉的重复上报数
     details: tuple[tuple[str, RejectReason, str], ...] = ()

@@ -26,6 +26,7 @@ def _percentile(sorted_vals: list[float], pct: float) -> float:
 class Metrics:
     accepted: int = 0
     duplicates: int = 0
+    merged: int = 0                     # 跨渠道被合并掉的重复上报
     conflicts: int = 0
     quarantined: int = 0
     rejected: int = 0
@@ -67,6 +68,7 @@ class Metrics:
         return {
             "accepted": self.accepted,
             "duplicates": self.duplicates,
+            "merged": self.merged,
             "conflicts": self.conflicts,
             "quarantined": self.quarantined,
             "rejected": self.rejected,

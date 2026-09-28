@@ -173,6 +173,98 @@ class PublishedWindowStore:
         return out
 
 
+class MergedTradeStore:
+    """跨渠道合并记录的仅追加持久化（``merged_trades.jsonl``）。
+
+    每行记录一笔被合并掉的次报：完整事件字段 + 主报引用
+    （``winner_event_id`` / ``winner_source`` / ``trade_key``）。
+    用途：
+    * 审计：哪几路被合并、以哪一路为准可查询；
+    * 重放：被合并次报不进事件日志（不计聚合），但渠道水位推进、
+      去重身份与合并留痕从本文件恢复，保证重启/重放不重复计算。
+    """
+
+    def __init__(self, data_dir: str) -> None:
+        self._path: str | None = None
+        self._existing: set[tuple[str, str]] = set()
+        if data_dir != ":memory:":
+            os.makedirs(data_dir, exist_ok=True)
+            self._path = os.path.join(data_dir, "merged_trades.jsonl")
+            if os.path.exists(self._path):
+                with open(self._path, encoding="utf-8") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if line:
+                            rec = json.loads(line)
+                            self._existing.add(
+                                (rec["winner_event_id"], rec["loser_event_id"]))
+
+    @staticmethod
+    def _to_dict(rec) -> dict:
+        from .models import MergedTradeRecord  # noqa: F401（类型对照）
+        d = {
+            "symbol": rec.trade_key[0],
+            "trade_id": rec.trade_key[1],
+            "winner_event_id": rec.winner_event_id,
+            "winner_source": rec.winner_source,
+            "loser_event_id": rec.loser_event_id,
+            "loser_source": rec.loser_source,
+            "loser_seq": rec.loser_seq,
+            "event_time_ms": rec.event_time_ms,
+        }
+        if rec.loser_event is not None:
+            d["loser_event"] = _event_to_dict(rec.loser_event)
+        return d
+
+    def append_batch(self, records: list) -> None:
+        if self._path is None or not records:
+            return
+        # 以 (winner, loser) 身份去重，整段重放/重复提交不产生重复留痕
+        fresh = [r for r in records
+                 if (r.winner_event_id, r.loser_event_id) not in self._existing]
+        if not fresh:
+            return
+        payload = "".join(
+            json.dumps(self._to_dict(r), sort_keys=True,
+                       ensure_ascii=False, separators=(",", ":")) + "\n"
+            for r in fresh)
+        with open(self._path, "a", encoding="utf-8") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        for r in fresh:
+            self._existing.add((r.winner_event_id, r.loser_event_id))
+
+    def load_records(self):
+        """重建 :class:`MergedTradeRecord` 列表（文件顺序，确定性）。"""
+        from .models import MergedTradeRecord
+        out: list[MergedTradeRecord] = []
+        for rec in self.load_all():
+            loser_ev = Event(**rec["loser_event"]) if rec.get("loser_event") else None
+            out.append(MergedTradeRecord(
+                trade_key=(rec["symbol"], rec["trade_id"]),
+                winner_event_id=rec["winner_event_id"],
+                winner_source=rec["winner_source"],
+                loser_event_id=rec["loser_event_id"],
+                loser_source=rec["loser_source"],
+                event_time_ms=rec["event_time_ms"],
+                loser_event=loser_ev,
+                loser_seq=rec.get("loser_seq", -1),
+            ))
+        return out
+
+    def load_all(self) -> list[dict]:
+        if self._path is None or not os.path.exists(self._path):
+            return []
+        out: list[dict] = []
+        with open(self._path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    out.append(json.loads(line))
+        return out
+
+
 class QuarantineStore:
     """隔离区仅追加持久化（重启后隔离记录仍可查询、位点语义连续）。"""
 
