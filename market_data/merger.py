@@ -19,8 +19,12 @@
 ========
 同一 ``(symbol, trade_id)`` 不同渠道上报的**关键内容**（``price``、
 ``quantity``）对不上时，绝不静默按一方计算：该笔成交标记为冲突，
-当批相关上报全部以 ``merge_conflict`` 隔离，原因码与普通重复
+**所有**相关上报都以 ``merge_conflict`` 隔离——包括此前已入窗但尚未
+发布的主报（确认冲突时从窗口清出，见 :meth:`CrossSourceMerger.evict_winner`），
+结果与"分几次投递、一次投几路"无关；原因码与普通重复
 （``duplicate_identical``）明确区分；冲突一旦成立不再解除。
+已发布窗口不可变：窗口发布后到达的冲突副本只隔离新到上报，
+已发布结果逐位不变。
 ``event_time_ms``、``venue`` 差异不属于冲突（各渠道时钟/场所命名可不同）。
 """
 from __future__ import annotations
@@ -155,6 +159,16 @@ class CrossSourceMerger:
     def mark_conflicted(self, trade_key: tuple[str, str]) -> None:
         self._conflicted.add(trade_key)
 
+    def evict_winner(self, trade_key: tuple[str, str]) -> Event | None:
+        """冲突成立时弹出当前主报（若尚未随窗口发布）。
+
+        服务据此把该主报从未发布窗口移除并以 ``merge_conflict`` 隔离：
+        同一笔成交的冲突一旦确认，先到的一路也不得计入成交量/价格特征。
+        已发布窗口的主报不在 ``_winners`` 中（已压缩进 ``_published_winners``），
+        不可变，返回 None。
+        """
+        return self._winners.pop(trade_key, None)
+
     def take_superseded(self) -> dict[str, Event]:
         """取出本批被替换、需要从打开窗口移除的旧主报（取走即清空）。"""
         out = self._superseded
@@ -192,6 +206,16 @@ class CrossSourceMerger:
                                                       tuple[str, str, float, float]]) -> None:
         self._published_winners.update(entries)
 
+    def register_published_winner(self, event: Event) -> None:
+        """重放恢复：事件日志中属于已发布窗口的带 trade_id 事件即该笔成交
+        的已发布主报，压缩指纹回灌，保证重启后同一笔成交的迟到上报仍按
+        合并/冲突判定，不会被当成新成交重新计入。"""
+        key = _trade_key(event)
+        if key is None:
+            return
+        self._published_winners.setdefault(
+            key, (event.event_id, event.source, event.price, event.quantity))
+
     # ---------- 查询 ----------
     def is_conflicted(self, key: tuple[str, str]) -> bool:
         return key in self._conflicted
@@ -225,7 +249,7 @@ class CrossSourceMerger:
 
     def restore_snapshot(self, snap) -> None:
         (self._winners, self._published_winners, self._pending,
-         self._records, conflicted, self._superseded) = (
+         self._records, self._conflicted, self._superseded) = (
             copy.deepcopy(snap[0]), copy.deepcopy(snap[1]),
             copy.deepcopy(snap[2]), copy.deepcopy(snap[3]),
             set(snap[4]), copy.deepcopy(snap[5]))
