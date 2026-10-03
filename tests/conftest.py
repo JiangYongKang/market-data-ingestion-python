@@ -7,11 +7,51 @@
 from __future__ import annotations
 
 import logging
+import os
 
 import pytest
 
 from market_data.config import Config
-from market_data.service import decision_logger, MarketDataService
+from market_data.service import MarketDataService, decision_logger
+
+#: 测试文件 -> 业务域说明（用于测试结束后的分业务汇总）。
+BUSINESS_AREAS: dict[str, str] = {
+    "test_01_dedup.py": "幂等与内容冲突去重",
+    "test_02_out_of_order.py": "乱序与水位线",
+    "test_03_schema_evolution.py": "行情结构兼容演进",
+    "test_04_checkpoint_replay.py": "检查点与重放",
+    "test_05_concurrency.py": "并发一致性",
+    "test_06_backpressure_benchmark.py": "背压与本地基准",
+    "test_07_window_features.py": "窗口特征聚合",
+    "test_08_http_api.py": "HTTP 接口",
+    "test_09_retention.py": "保留与资源清理",
+    "test_10_multi_source.py": "多来源接入与跨渠道合并",
+    "test_11_multi_source_bugfix.py": "多来源修复回归（分标的推进/冲突投递形状/重启重放）",
+}
+
+_outcomes: dict[str, dict[str, int]] = {}
+
+
+def pytest_runtest_logreport(report):
+    if report.when != "call":
+        return
+    fname = os.path.basename(report.nodeid.split("::")[0])
+    bucket = _outcomes.setdefault(fname, {"passed": 0, "failed": 0, "skipped": 0})
+    if report.outcome in bucket:
+        bucket[report.outcome] += 1
+
+
+def pytest_terminal_summary(terminalreporter):
+    """按业务域汇总用例与通过情况，便于从日志确认覆盖面。"""
+    terminalreporter.write_sep("=", "业务覆盖汇总")
+    for fname in sorted(_outcomes):
+        area = BUSINESS_AREAS.get(fname, fname)
+        o = _outcomes[fname]
+        total = o["passed"] + o["failed"] + o["skipped"]
+        status = "OK" if o["failed"] == 0 else "FAILED"
+        terminalreporter.write_line(
+            f"[{status}] {area}（{fname}）：共 {total} 项，"
+            f"通过 {o['passed']}，失败 {o['failed']}，跳过 {o['skipped']}")
 
 
 @pytest.fixture(autouse=True)

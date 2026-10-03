@@ -12,7 +12,7 @@
 ```bash
 uv sync
 uv run uvicorn main:app --reload        # 启动 HTTP 服务（默认数据目录 .mdi_data）
-uv run pytest -q                        # 运行全部 87 项测试（含判定日志）
+uv run pytest -q                        # 运行全部 98 项测试（含判定日志与业务覆盖汇总）
 curl -X POST localhost:8000/ingest -H 'content-type: application/json' -d '[
   {"event_id":"e1","source":"venueA","seq":1,"symbol":"600000",
    "price":10.0,"quantity":3,"event_time_ms":1000},
@@ -104,20 +104,21 @@ watermark_ms = max(已接纳事件 event_time_ms) - allowed_lateness_ms
 ### 渠道间时间线互不干扰
 
 ```
-channel_wm(src) = max(该渠道已接纳 event_time_ms) - allowed_lateness_ms
-symbol_publish_wm(sym) = min(channel_wm(src))
+channel_wm(sym, src) = max(该标的该渠道已接纳 event_time_ms) - allowed_lateness_ms
+symbol_publish_wm(sym) = min(channel_wm(sym, src))
     src ∈ 曾为 sym 提供"主报"的渠道，剔除停滞渠道
 ```
 
-* 迟到判定只与**事件所属渠道**的水位比较：某个渠道跑得很快，不会把另一个
-  落后/暂未到数渠道的事件误判成超水位迟到而丢进隔离区；
-* 窗口在**所有参与渠道**都越过窗口右边界后才发布，因此窗口结果按各渠道
+* 推进判定按 **(标的, 渠道)** 各自独立：同一渠道同时推多个标的时，一个标的
+  跑得快不会把同渠道另一标的的正常事件误判迟到；同一标的下落后渠道也不会
+  被跑得快的渠道误伤——迟到判定只与**本标的本渠道**的水位比较；
+* 窗口在**该标的所有参与渠道**都越过窗口右边界后才发布，因此窗口结果按各渠道
   **实际到齐**的事件算对，不会因为一个快渠道提前关窗而漏掉慢渠道；
 * **只有提供主报的渠道参与关窗**。只转发被合并冗余副本、或只产生隔离事件
   的渠道不参与，避免一个辅助渠道停更就把结果窗口无限拖住；
-* 某渠道连续 `source_idle_timeout_ms`（默认 30s，**处理时间**）没有任何数据，
-  标记为**停滞**，暂时移出取最小值的集合，使结果可继续推进；该渠道恢复来数后
-  自动重新参与。停滞只影响"何时发布"，**永不丢数据**。
+* 某渠道在某标的上连续 `source_idle_timeout_ms`（默认 30s，**处理时间**）没有
+  任何数据，标记为**停滞**，暂时移出取最小值的集合，使结果可继续推进；该渠道
+  恢复来数后自动重新参与。停滞只影响"何时发布"，**永不丢数据**。
 
 ### 跨渠道成交合并与取舍
 
@@ -132,18 +133,28 @@ symbol_publish_wm(sym) = min(channel_wm(src))
    留痕于 `merged_trades.jsonl` / `GET /merged`，标明胜者与被合并者），
    **不重复计入成交量与价格特征**；
 4. **关键内容冲突**：若不同渠道对同一 `trade_id` 上报的 `price` 或 `quantity`
-   对不上，**绝不静默按一方计算**：该笔成交在本批的相关上报全部进入隔离区，
-   原因 `merge_conflict`（与普通重复 `duplicate_identical`、普通迟到
-   `late_beyond_watermark` 在原因码/HTTP/日志三处都可区分）。冲突一旦成立不解除；
-   窗口已发布后到达的冲突副本同样隔离，已发布结果逐位不变。
+   对不上，**绝不静默按一方计算**：确认冲突后该笔成交**整笔隔离**——本批相关
+   上报全部进入隔离区；若先到的某一路此前已入窗但窗口**尚未发布**，确认冲突时
+   也会把它从窗口结果里清出并一并隔离。因此隔离结果与"分几次投递、一次投几路"
+   **无关**：同批到达与分批先后到达的最终状态完全一致。原因 `merge_conflict`
+   （与普通重复 `duplicate_identical`、普通迟到 `late_beyond_watermark` 在
+   原因码/HTTP/日志三处都可区分）。冲突一旦成立不解除；窗口已发布后到达的冲突
+   副本同样隔离，**已发布结果逐位不变**（不可变真相不回改）。
 
 ### 重启与整段重放一致性
 
-* 各渠道水位、参与关系从事件日志（主报）+ 合并日志（被合并次报）重建，
+* 各 (标的,渠道) 推进位置由事件日志（主报）+ 合并日志（被合并次报）+
+  **隔离日志（迟到/冲突事件）**共同重建——隔离事件在接纳时已推进所属时间线，
+  重启后该推进不丢，同一条路早先判迟到的事件不会被重启后重新接纳；
   已发布窗口仍以 `published_windows.jsonl` 为唯一真相；
+* 合并主报表从事件日志重放重建：重启后另一路一致上报仍被合并（不双计）、
+  不一致仍判冲突；被高优先级替换的主报、确认冲突被清出的主报在重放时
+  **不会**重新进入窗口；
 * 被合并次报不进事件日志、不参与聚合，但其身份进入去重表、所属渠道水位照常推进；
 * 整段重放同一批数据：主报与次报均命中 `event_id`/`(source,seq)` 双键去重，
-  结果全部幂等——已发布窗口不改变、同一笔成交不会被重新计算、合并留痕不翻倍。
+  结果全部幂等——已发布窗口不改变、同一笔成交不会被重新计算、合并留痕不翻倍；
+* `GET /channels` / `GET /metrics` 在重启后同样能看到各渠道推进到哪、
+  落后多少（含只产生过隔离事件的渠道）。
 
 ### 容量上限与观测
 
@@ -183,7 +194,7 @@ symbol_publish_wm(sym) = min(channel_wm(src))
 | 内容冲突重复 | `duplicate_conflict`（422） | 整批拒绝 |
 | 完全一致重复 | 响应 `duplicate`（200） | 幂等忽略 |
 | 超水位/已发布窗口迟到 | `late_beyond_watermark`（200，可查询） | 进隔离区，位点推进 |
-| 跨渠道同笔成交价格/数量冲突 | `merge_conflict`（200，可查询） | 相关上报进隔离区，不按任一方计入 |
+| 跨渠道同笔成交价格/数量冲突 | `merge_conflict`（200，可查询） | 整笔隔离：相关上报进隔离区；已入窗未发布主报一并清出，不按任一方计入 |
 | 跨渠道同笔成交冗余上报 | `cross_source_merged`（200，计数 `merged`） | 合并且留痕，不双计 |
 | 渠道数量超过上限 | `source_limit_rejected`（503） | 整批拒绝 |
 | 积压/隔离区超限 | `backpressure_rejected`（503/异常） | 整批拒绝 |
@@ -222,7 +233,7 @@ symbol_publish_wm(sym) = min(channel_wm(src))
 废弃字段计数、已发布窗口数、背压/回退拒绝数、当前/峰值积压、
 状态内存保守估计 `estimated_state_bytes`、以及每事件耗时
 `avg/p50/p99 ns_per_event` 与当前水位、隔离区大小。多来源模式下额外暴露
-`channels`（逐渠道推进位置/水位/落后/停滞）、`stalled_channels`、
+`channels`（逐渠道推进位置/水位/落后/停滞，附逐 (标的,渠道) 明细 `symbols`）、`stalled_channels`、
 `lagging_channels`；`GET /channels` 返回相同的逐渠道观测，
 `GET /merged` 返回跨渠道合并留痕。
 `POST /benchmark {"count":N,"symbols":K}` 在内存隔离环境合成确定性行情
@@ -232,16 +243,20 @@ symbol_publish_wm(sym) = min(channel_wm(src))
 ## 本地验证方法
 
 ```bash
-uv run pytest -q                      # 87 项：去重/乱序/结构演进/重放/并发/背压/HTTP + 多来源
-uv run pytest tests/test_10_multi_source.py              # 多来源专题（31 项）
+uv run pytest -q                      # 98 项：去重/乱序/结构演进/重放/并发/背压/HTTP + 多来源
+                                      # （末尾输出"业务覆盖汇总"：各业务域用例数与通过情况）
+uv run pytest tests/test_10_multi_source.py              # 多来源专题（33 项）
+uv run pytest tests/test_11_multi_source_bugfix.py       # 多来源修复回归（9 项）
 uv run pytest tests/test_10_multi_source.py -o log_cli=true   # 观察合并/冲突/渠道水位日志
 uv run python -m market_data.demo     # 端到端脚本演示（见该模块）
 ```
 
 多来源专题覆盖：跨渠道一致合并且不双计、主报优先级与后来居上、
-价格/数量冲突隔离且原因可区分、慢渠道不被快渠道误判迟到、
-窗口等待各参与渠道到齐、停滞渠道剔除与恢复、重启/整段重放逐位一致、
-渠道数量与积压容量上限、逐渠道观测。
+价格/数量冲突整笔隔离且原因可区分、**冲突结果与分批/合批投递形状无关**、
+慢渠道不被快渠道误判迟到、**同一渠道多标的推进互不影响**、
+窗口等待各参与渠道到齐、停滞渠道剔除与恢复、
+**重启/整段重放后渠道推进位置与合并状态逐位一致**、
+渠道数量与积压容量上限、逐渠道（含逐标的明细）观测。
 
 判定日志格式：
 `decision event_id=… event_time_ms=… watermark_ms=… -> <accepted|duplicate|quarantined|…> reason=… | 依据`

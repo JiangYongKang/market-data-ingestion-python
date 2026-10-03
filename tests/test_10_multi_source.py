@@ -106,13 +106,14 @@ def test_events_without_trade_id_not_merged(mservice):
 def test_price_mismatch_quarantined_as_merge_conflict(mservice):
     mservice.ingest_sync([trade("a9", "a", 9, 60000, tid="T9", p=10.0, q=1.0)])
     r = mservice.ingest_sync([trade("b9", "b", 9, 60001, tid="T9", p=11.0, q=1.0)])
-    assert r.accepted == 0 and r.quarantined == 1 and r.merged == 0
-    assert r.details[0][1] is RejectReason.MERGE_CONFLICT
+    # 确认冲突即整笔隔离：b9 与已入窗但未发布的 a9 都进隔离区，都不计入
+    assert r.accepted == 0 and r.quarantined == 2 and r.merged == 0
+    assert all(d[1] is RejectReason.MERGE_CONFLICT for d in r.details)
     q = mservice.quarantine_list("A")
     rec = [x for x in q if x.reason is RejectReason.MERGE_CONFLICT]
-    assert len(rec) == 1
-    assert rec[0].event.event_id == "b9"
-    assert "T9" in rec[0].detail
+    assert {x.event.event_id for x in rec} == {"a9", "b9"}
+    assert all("T9" in x.detail for x in rec)
+    assert mservice.query_provisional("A", 60000) is None
 
 
 def test_quantity_mismatch_is_merge_conflict_not_duplicate(mservice):
@@ -120,11 +121,10 @@ def test_quantity_mismatch_is_merge_conflict_not_duplicate(mservice):
     r = mservice.ingest_sync([trade("b1", "b", 1, 1001, tid="T1", q=3.0)])
     assert r.details[0][1] is RejectReason.MERGE_CONFLICT
     assert r.details[0][1] is not RejectReason.DUPLICATE_IDENTICAL
-    # 冲突次报绝不计入：窗口内只有首报一笔，成交量不翻倍
-    prov = mservice.query_provisional("A", 0)
-    assert prov.event_ids == ("a1",) and prov.total_quantity == 2.0
-    assert any(x.reason is RejectReason.MERGE_CONFLICT
-               for x in mservice.quarantine_list("A"))
+    # 确认冲突后整笔隔离：先到但未发布的 a1 也被清出，窗口一笔都不计
+    assert mservice.query_provisional("A", 0) is None
+    assert {x.event.event_id for x in mservice.quarantine_list("A")
+            if x.reason is RejectReason.MERGE_CONFLICT} == {"a1", "b1"}
 
 
 def test_merge_conflict_distinct_from_late_quarantine(mservice):
@@ -350,10 +350,11 @@ def test_backpressure_delay_strategy_eventually_succeeds(tmp_data_dir):
 
 
 def test_quarantine_cap_rejects_merge_conflict_overflow(tmp_data_dir):
-    svc = MarketDataService(multi_config(tmp_data_dir, max_quarantine_size=1))
+    # 确认冲突即整笔隔离：一次冲突产生 2 条隔离记录（后到路 + 被清出的先到路）
+    svc = MarketDataService(multi_config(tmp_data_dir, max_quarantine_size=2))
     svc.ingest_sync([trade("a9", "a", 90, 60000, tid="T9", p=10.0, q=1.0)])
     svc.ingest_sync([trade("b9", "b", 90, 60001, tid="T9", p=11.0, q=1.0)])
-    # 隔离区已满 1；再来一笔冲突 -> 整批背压拒绝（序号单调，不触碰位点回退）
+    # 隔离区已满 2；再来一笔冲突 -> 整批背压拒绝（序号单调，不触碰位点回退）
     svc.ingest_sync([trade("a8", "a", 91, 70000, tid="T8", p=10.0, q=1.0)])
     with pytest.raises(BackpressureError):
         svc.ingest_sync([trade("b8", "b", 91, 70001, tid="T8", p=12.0, q=1.0)])
@@ -429,12 +430,15 @@ def test_http_merge_conflict_quarantined_with_distinct_reason(tmp_path):
     c.post("/ingest", json=trade("a9", "a", 9, 60000, tid="T9", p=10.0, q=1.0))
     resp = c.post("/ingest", json=trade("b9", "b", 9, 60001, tid="T9", p=11.0, q=1.0))
     body = resp.json()
-    # 隔离属于正常 200 结果（不是整批 422），原因码可与普通重复区分
+    # 隔离属于正常 200 结果（不是整批 422），原因码可与普通重复区分；
+    # 确认冲突即整笔隔离：后到路与被清出的先到路各一条记录
     assert resp.status_code == 200
-    assert body["quarantined"] == 1
-    assert body["details"][0]["reason"] == "merge_conflict"
+    assert body["quarantined"] == 2
+    assert all(d["reason"] == "merge_conflict" for d in body["details"])
     q = c.get("/quarantine").json()
-    assert any(i["reason"] == "merge_conflict" for i in q["items"])
+    conflict_ids = {i["event"]["event_id"] for i in q["items"]
+                    if i["reason"] == "merge_conflict"}
+    assert conflict_ids == {"a9", "b9"}
 
 
 # ---------- 边界：同批冲突扩散 / 默认优先级 / 隔离不改已发布 ----------

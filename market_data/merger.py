@@ -19,9 +19,12 @@
 ========
 同一 ``(symbol, trade_id)`` 不同渠道上报的**关键内容**（``price``、
 ``quantity``）对不上时，绝不静默按一方计算：该笔成交标记为冲突，
-当批相关上报全部以 ``merge_conflict`` 隔离，原因码与普通重复
-（``duplicate_identical``）明确区分；冲突一旦成立不再解除。
-``event_time_ms``、``venue`` 差异不属于冲突（各渠道时钟/场所命名可不同）。
+**整笔隔离**——本批相关上报全部以 ``merge_conflict`` 隔离；若先到的
+主报此前已入窗但窗口尚未发布，确认冲突时也会经 :meth:`evict_winner`
+从结果中清出并一并隔离，因此隔离结果与"分几次投递、一次投几路"无关。
+原因码与普通重复（``duplicate_identical``）明确区分；冲突一旦成立不再
+解除。``event_time_ms``、``venue`` 差异不属于冲突（各渠道时钟/场所命名
+可不同）。窗口已发布后到达的冲突副本仍隔离，已发布结果逐位不变。
 """
 from __future__ import annotations
 
@@ -154,6 +157,14 @@ class CrossSourceMerger:
 
     def mark_conflicted(self, trade_key: tuple[str, str]) -> None:
         self._conflicted.add(trade_key)
+
+    def evict_winner(self, trade_key: tuple[str, str]) -> Event | None:
+        """确认冲突后移除当前主报（其窗口尚未发布）：返回被移除的主报。
+
+        与 :meth:`mark_conflicted` 配合实现"整笔隔离"：冲突一旦确认，
+        已入窗但尚未发布的主报也要从结果里清出，绝不按任何一方计入。
+        """
+        return self._winners.pop(trade_key, None)
 
     def take_superseded(self) -> dict[str, Event]:
         """取出本批被替换、需要从打开窗口移除的旧主报（取走即清空）。"""

@@ -132,10 +132,16 @@ class MarketDataService:
 
         * 已发布窗口仍是不可变真相，直接回灌；
         * 隔离记录（含 merge_conflict）身份入去重表、冲突态回灌；
+          **隔离事件在接纳时已推进所属 (标的,渠道) 时间线，恢复时同样还原**——
+          否则重启后同一条路早先判迟到的事件会被重新接纳，与重启前对不上；
+          确认冲突被清出窗口的主报（同时在事件日志与隔离区）重放时不再入窗；
+        * 合并日志中的被合并次报不进窗、不作为主报，但恢复去重身份、
+          推进所属 (标的,渠道) 水位；
         * 事件日志只含各笔成交的**主报**，按 (event_time,event_id) 排序
-          重放进窗——取舍规则确定，主报集合与崩溃前一致；
-        * 合并日志中的被合并次报不进窗，但恢复去重身份、推进所属渠道水位；
-        * 渠道水位/参与关系由主报+次报共同恢复，窗口按各标的水位发布。
+          重放进窗，并据此重建合并主报表——重启后另一路一致上报仍被合并、
+          不一致仍判冲突，取舍规则与崩溃前一致；
+        * 渠道水位/参与关系由主报+次报+隔离事件共同恢复，窗口按各标的
+          水位发布，已发布结果逐位不变。
         """
         assert self._channels is not None and self._merger is not None
         already = self._published_store.load_all()
@@ -143,29 +149,47 @@ class MarketDataService:
 
         quarantined = self._quarantine_store.load_all()
         conflict_keys: list[tuple[str, str]] = []
+        conflict_evicted_ids: set[str] = set()
         for q in quarantined:
             self._dedup.check(q.event)
-            if q.reason is RejectReason.MERGE_CONFLICT and q.event.trade_id:
-                conflict_keys.append((q.event.symbol, q.event.trade_id))
+            # 隔离事件在接纳时已推进所属 (标的,渠道) 时间线，恢复必须还原，
+            # 否则重启后同一条路更早的事件会被重新接纳计入。
+            self._channels.restore(q.event.symbol, q.event.source,
+                                   q.event.event_time_ms)
+            if q.reason is RejectReason.MERGE_CONFLICT:
+                # 确认冲突被清出窗口的主报也在事件日志里：重放时跳过入窗。
+                conflict_evicted_ids.add(q.event.event_id)
+                if q.event.trade_id:
+                    conflict_keys.append((q.event.symbol, q.event.trade_id))
         self._quarantine.restore(quarantined)
         self._merger.restore_conflicted(conflict_keys)
 
         # 合并记录回灌（留痕 + 被合并事件身份/渠道推进）。
-        # 次报只推进其渠道水位与去重身份，不作为窗口关窗参与方。
+        # 次报只推进其渠道水位与去重身份，不作为窗口关窗参与方、不进窗、
+        # 不作为主报（次报此前被接纳过、也在事件日志里，重放时跳过入窗）。
         merged_records = self._merged_store.load_records()
         self._merger.restore(merged_records)
+        merged_loser_ids: set[str] = set()
         for rec in merged_records:
+            merged_loser_ids.add(rec.loser_event_id)
             loser = rec.loser_event
             if loser is not None:
                 self._dedup.check(loser)
-                self._channels.restore(loser.source, loser.event_time_ms)
+                self._channels.restore(loser.symbol, loser.source,
+                                       loser.event_time_ms)
 
         events = self._log.replay_all()
         for ev in sorted(events, key=lambda e: (e.event_time_ms, e.event_id)):
             self._dedup.check(ev)
-            self._channels.restore(ev.source, ev.event_time_ms)
+            self._channels.restore(ev.symbol, ev.source, ev.event_time_ms)
             # 事件日志只含主报：这些渠道才参与该标的窗口关窗判定。
             self._channels.note_symbol_source(ev.symbol, ev.source)
+            if ev.event_id in merged_loser_ids \
+                    or ev.event_id in conflict_evicted_ids:
+                continue
+            # 重建合并主报表（含已发布窗口的主报，随后由
+            # mark_winners_published 压缩为身份+关键内容指纹）。
+            self._merger.register_winner(ev)
             w0 = self._windows.window_start_for(ev.event_time_ms)
             if self._windows.is_published(ev.symbol, w0):
                 continue
@@ -200,10 +224,11 @@ class MarketDataService:
         """多来源批次：每渠道独立水位判定 + 跨渠道成交合并。
 
         三阶段（只读预检 -> 快照提交 -> 持久化），与单来源一致；差异：
-        * 迟到判定只与**事件所属渠道**水位比较，渠道间互不影响；
+        * 迟到判定只与**事件所属 (标的,渠道)** 水位比较，渠道间、标的间互不影响；
         * 同一 (symbol, trade_id) 的跨渠道上报先合并判定：关键内容一致 ->
-          非主报计入 merged 留痕、不进聚合；不一致 -> 该笔本批相关上报
-          全部以 merge_conflict 隔离，绝不静默按一方算。
+          非主报计入 merged 留痕、不进聚合；不一致 -> 该笔**整笔**以
+          merge_conflict 隔离（含已入窗但未发布的先到主报，确认冲突时
+          从结果中清出），绝不静默按一方算，结果与投递批次划分无关。
         """
         assert self._channels is not None and self._merger is not None
         channels, merger = self._channels, self._merger
@@ -274,8 +299,11 @@ class MarketDataService:
         # 按 (event_time, event_id) 升序，与重放顺序一致 -> 取舍确定。
         ordered = sorted(parsed, key=lambda e: (e.event_time_ms, e.event_id))
         sim_winners: dict[tuple[str, str], Event] = dict(merger._winners)  # noqa: SLF001
+        committed_keys = set(merger._winners)  # noqa: SLF001（本批之前已入窗的主报）
         published_trades = merger._published_winners  # noqa: SLF001
         conflicted = set(merger._conflicted)  # noqa: SLF001
+        batch_local: set[tuple[str, str]] = set()   # 本批新占位的 key（非已提交主报）
+        evictions: dict[tuple[str, str], Event] = {}  # 确认冲突需清出的已提交主报
         mv_of: dict[int, str] = {}
         for ev in ordered:
             key = _trade_key(ev)
@@ -295,15 +323,22 @@ class MarketDataService:
                 # 首报；或同渠道同 trade_id（不是跨渠道合并，正常处理）
                 if cur is None:
                     sim_winners[key] = ev
+                    batch_local.add(key)
                 mv_of[id(ev)] = "normal"
                 continue
             if (ev.price, ev.quantity) != (cur.price, cur.quantity):
                 mv_of[id(ev)] = "conflict"
                 conflicted.add(key)
+                # 与**已提交且未发布**的主报冲突：冲突结果不得随投递形状而变，
+                # 该主报也要从窗口清出并整笔隔离（本批占位的主报由冲突扩散处理）。
+                if key in committed_keys and key not in batch_local \
+                        and key not in evictions:
+                    evictions[key] = cur
                 continue
             if merger._rank(ev.source) < merger._rank(cur.source):  # noqa: SLF001
                 mv_of[id(ev)] = "replace"         # 高优先级后来居上
                 sim_winners[key] = ev
+                batch_local.add(key)
             else:
                 mv_of[id(ev)] = "loser"
 
@@ -315,16 +350,17 @@ class MarketDataService:
                     and dedup_verdict[id(ev)] != "duplicate":
                 mv_of[id(ev)] = "conflict"
 
-        # ===== 阶段一-c：渠道迟到判定（每渠道独立"运行中水位"） =====
-        # 模拟本批按时间升序逐条到达：事件 i 看到的本渠道水位只由该渠道
-        # 已处理的 0..i-1 推进，等价于实时逐条到达（同批乱序不被未来误伤）。
-        running_max: dict[str, int] = {
-            s: st.max_event_time_ms for s, st in channels._channels.items()  # noqa: SLF001
+        # ===== 阶段一-c：渠道迟到判定（每 (标的,渠道) 独立"运行中水位"） =====
+        # 模拟本批按时间升序逐条到达：事件 i 看到的本 (标的,渠道) 水位只由
+        # 该 (标的,渠道) 已处理的 0..i-1 推进，等价于实时逐条到达
+        # （同批乱序不被未来误伤；同渠道其他标的的进度也不参与判定）。
+        running_max: dict[tuple[str, str], int] = {
+            k: st.max_event_time_ms for k, st in channels._channels.items()  # noqa: SLF001
             if st.max_event_time_ms is not None}
         allowed = self.config.allowed_lateness_ms
 
-        def running_late(source: str, t: int) -> bool:
-            base = running_max.get(source)
+        def running_late(symbol: str, source: str, t: int) -> bool:
+            base = running_max.get((symbol, source))
             return base is not None and t <= base - allowed
 
         accepted: list[Event] = []
@@ -334,8 +370,30 @@ class MarketDataService:
         merged_count = 0
         details: list[tuple[str, RejectReason, str]] = []
         q_seats = self._quarantine._max - self._quarantine.size  # noqa: SLF001
+        # 确认冲突需清出的已提交主报：同样占用隔离区容量，容量不足整批拒绝。
+        evicted_items: list[tuple[Event, str]] = []
+        for key, old_ev in sorted(evictions.items()):
+            detail = (f"同一笔成交 (symbol={old_ev.symbol!r}, trade_id="
+                      f"{old_ev.trade_id!r}) 被渠道 {old_ev.source!r} 与其他渠道"
+                      f"以不一致的价格/数量上报，确认冲突；本路此前已入窗但窗口"
+                      f"尚未发布，现将事件 {old_ev.event_id!r} 从结果中清出，"
+                      f"整笔隔离待核对（不按任何一方计入）")
+            evicted_items.append((old_ev, detail))
+            details.append((old_ev.event_id, RejectReason.MERGE_CONFLICT, detail))
+            self.metrics.conflicts += 1
+            self._log_decision(old_ev.event_id, old_ev.event_time_ms,
+                               channels.channel_watermark(old_ev.symbol,
+                                                          old_ev.source),
+                               "quarantined", RejectReason.MERGE_CONFLICT, detail)
+        if len(evicted_items) > q_seats:
+            self.metrics.backpressure_rejected += 1
+            raise BackpressureError(
+                RejectReason.BACKPRESSURE_REJECTED,
+                f"隔离区已满（{self.config.max_quarantine_size}），整批拒绝",
+                event_id=None)
+        q_seats -= len(evicted_items)
         for ev in ordered:
-            ch_wm = channels.channel_watermark(ev.source)
+            ch_wm = channels.channel_watermark(ev.symbol, ev.source)
             if dedup_verdict[id(ev)] == "duplicate":
                 duplicates += 1
                 details.append((ev.event_id, RejectReason.DUPLICATE_IDENTICAL,
@@ -364,10 +422,11 @@ class MarketDataService:
                 self._log_decision(ev.event_id, ev.event_time_ms, ch_wm,
                                    "quarantined", reason, detail)
                 # 冲突事件仍代表该渠道已处理到该序号 -> 推进其运行中水位
-                running_max[ev.source] = max(
-                    running_max.get(ev.source, ev.event_time_ms), ev.event_time_ms)
+                running_max[(ev.symbol, ev.source)] = max(
+                    running_max.get((ev.symbol, ev.source), ev.event_time_ms),
+                    ev.event_time_ms)
                 continue
-            if running_late(ev.source, ev.event_time_ms) \
+            if running_late(ev.symbol, ev.source, ev.event_time_ms) \
                     or self._windows.is_published(ev.symbol, w0):
                 if q_seats <= 0:
                     self.metrics.backpressure_rejected += 1
@@ -376,7 +435,7 @@ class MarketDataService:
                         f"隔离区已满（{self.config.max_quarantine_size}），整批拒绝",
                         event_id=ev.event_id)
                 q_seats -= 1
-                if running_late(ev.source, ev.event_time_ms):
+                if running_late(ev.symbol, ev.source, ev.event_time_ms):
                     detail = (f"渠道 {ev.source!r} event_time_ms={ev.event_time_ms} <= "
                               f"本渠道 watermark_ms={ch_wm}，超过允许迟到 "
                               f"{self.config.allowed_lateness_ms}ms")
@@ -388,8 +447,9 @@ class MarketDataService:
                 details.append((ev.event_id, RejectReason.LATE_BEYOND_WATERMARK, detail))
                 self._log_decision(ev.event_id, ev.event_time_ms, ch_wm,
                                    "quarantined", RejectReason.LATE_BEYOND_WATERMARK, detail)
-                running_max[ev.source] = max(
-                    running_max.get(ev.source, ev.event_time_ms), ev.event_time_ms)
+                running_max[(ev.symbol, ev.source)] = max(
+                    running_max.get((ev.symbol, ev.source), ev.event_time_ms),
+                    ev.event_time_ms)
                 continue
             if mv in ("loser", "loser_published"):
                 loser_items.append(ev)
@@ -400,13 +460,15 @@ class MarketDataService:
                 self._log_decision(ev.event_id, ev.event_time_ms, ch_wm,
                                    "merged", RejectReason.CROSS_SOURCE_MERGED,
                                    f"merged into winner of trade {ev.trade_id}")
-                running_max[ev.source] = max(
-                    running_max.get(ev.source, ev.event_time_ms), ev.event_time_ms)
+                running_max[(ev.symbol, ev.source)] = max(
+                    running_max.get((ev.symbol, ev.source), ev.event_time_ms),
+                    ev.event_time_ms)
                 continue
             # normal / replace：作为（新）主报入窗
             accepted.append(ev)
-            running_max[ev.source] = max(
-                running_max.get(ev.source, ev.event_time_ms), ev.event_time_ms)
+            running_max[(ev.symbol, ev.source)] = max(
+                running_max.get((ev.symbol, ev.source), ev.event_time_ms),
+                ev.event_time_ms)
 
         pending_after = (self._windows.pending_event_count()
                          + self._quarantine.size + len(quarantined_items)
@@ -436,7 +498,8 @@ class MarketDataService:
                 self._dedup.check(ev)
                 # register_winner 内部在"高优先级替换"时生成旧主报合并记录
                 merger.register_winner(ev)
-                channels.observe(ev.source, ev.event_time_ms, now_ms=now_ms)
+                channels.observe(ev.symbol, ev.source, ev.event_time_ms,
+                                 now_ms=now_ms)
                 channels.note_symbol_source(ev.symbol, ev.source)
                 self._windows.add(ev)
                 _bump_seq(ev)
@@ -446,7 +509,8 @@ class MarketDataService:
                     merger.register_loser_published(ev)
                 else:
                     merger.register_loser(ev)
-                channels.observe(ev.source, ev.event_time_ms, now_ms=now_ms)
+                channels.observe(ev.symbol, ev.source, ev.event_time_ms,
+                                 now_ms=now_ms)
                 # 被合并副本不提供新成交 -> 不参与该标的窗口关窗判定，
                 # 否则一个只转发冗余拷贝、随后停更的辅助渠道会无限拖住发布。
                 _bump_seq(ev)
@@ -455,9 +519,17 @@ class MarketDataService:
                 w0o = self._windows.window_start_for(old_ev.event_time_ms)
                 self._windows.remove_open_event(old_ev.symbol, w0o, old_ev.event_id)
                 _bump_seq(old_ev)
+            # 确认冲突的已提交主报：从窗口清出、整笔标记冲突（须在发布判定之前，
+            # 否则本批推进的水位可能把含该主报的窗口发布出去）
+            for key, old_ev in evictions.items():
+                w0e = self._windows.window_start_for(old_ev.event_time_ms)
+                self._windows.remove_open_event(old_ev.symbol, w0e, old_ev.event_id)
+                merger.evict_winner(key)
+                merger.mark_conflicted(key)
             for ev, reason, _detail, _wm in quarantined_items:
                 self._dedup.check(ev)
-                channels.observe(ev.source, ev.event_time_ms, now_ms=now_ms)
+                channels.observe(ev.symbol, ev.source, ev.event_time_ms,
+                                 now_ms=now_ms)
                 # 被隔离事件不参与关窗（迟到/冲突副本不代表新成交）
                 _bump_seq(ev)
                 if reason is RejectReason.MERGE_CONFLICT and ev.trade_id:
@@ -479,6 +551,12 @@ class MarketDataService:
             QuarantinedEvent(event=ev, reason=reason, watermark_ms=wm,
                              detail=detail, accepted_at_ms=now_ms)
             for ev, reason, detail, wm in quarantined_items]
+        q_records += [
+            QuarantinedEvent(event=old_ev, reason=RejectReason.MERGE_CONFLICT,
+                             watermark_ms=channels.channel_watermark(
+                                 old_ev.symbol, old_ev.source),
+                             detail=detail, accepted_at_ms=now_ms)
+            for old_ev, detail in evicted_items]
         self._log.append_batch(accepted)
         self._published_store.append_many(published)
         self._quarantine_store.append_batch(q_records)
